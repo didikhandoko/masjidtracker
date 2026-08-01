@@ -724,27 +724,46 @@
   });
 
   function osmSearch(){
-    var c=userLoc||DEFAULT_CENTER, rad=state.rad||5000;
-    setOsmStatus('<i class="fas fa-spinner fa-spin"></i> Mencari dalam '+(rad/1000)+' km dari '+(userLoc?'lokasimu':'Alun-alun Wonosari')+'…');
+    if(userLoc){ runOsm(userLoc,true); return; }
+    // Belum ada lokasi -> minta GPS dulu supaya "sekitar" = sekitarmu
+    setOsmStatus('<i class="fas fa-spinner fa-spin"></i> Meminta izin lokasi…');
+    var httpsOK=(location.protocol==='https:'||location.hostname==='localhost');
+    if(navigator.geolocation && httpsOK){
+      navigator.geolocation.getCurrentPosition(function(pos){
+        userLoc={lat:pos.coords.latitude,lng:pos.coords.longitude}; renderAll(); runOsm(userLoc,true);
+      },function(){ runOsm(DEFAULT_CENTER,false); },{enableHighAccuracy:true,timeout:9000,maximumAge:60000});
+    } else { runOsm(DEFAULT_CENTER,false); }
+  }
+
+  function runOsm(c,fromGPS){
+    var rad=state.rad||5000, where=fromGPS?'lokasimu':'Alun-alun Wonosari';
+    setOsmStatus('<i class="fas fa-spinner fa-spin"></i> Mencari masjid dalam '+(rad/1000)+' km dari '+where+'…');
     $('btnOsm').disabled=true;
-    var q='[out:json][timeout:25];('
-      +'node["amenity"="place_of_worship"]["religion"="muslim"](around:'+rad+','+c.lat+','+c.lng+');'
-      +'way["amenity"="place_of_worship"]["religion"="muslim"](around:'+rad+','+c.lat+','+c.lng+');'
-      +');out center tags 300;';
-    var eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
+    var A='(around:'+rad+','+c.lat+','+c.lng+')';
+    // Query luas: religion=muslim, building=mosque, ATAU nama mengandung masjid/musala.
+    var q='[out:json][timeout:30];('
+      +'nwr["amenity"="place_of_worship"]["religion"="muslim"]'+A+';'
+      +'nwr["building"="mosque"]'+A+';'
+      +'nwr["amenity"="place_of_worship"]["name"~"masjid|mushol|musola|langgar|surau",i]'+A+';'
+      +');out center 250;';
+    var eps=['https://overpass-api.de/api/interpreter',
+             'https://overpass.kumi.systems/api/interpreter',
+             'https://maps.mail.ru/osm/tools/overpass/api/interpreter'];
     (function tryEp(i){
-      if(i>=eps.length){ fail('Server OSM sedang sibuk. Coba lagi sebentar lagi.'); return; }
-      var ctl=new AbortController(), to=setTimeout(function(){ ctl.abort(); },28000);
-      fetch(eps[i],{method:'POST',body:'data='+encodeURIComponent(q),signal:ctl.signal})
-        .then(function(r){ clearTimeout(to); if(!r.ok) throw new Error(r.status); return r.json(); })
-        .then(function(d){ done(d.elements||[],c); })
-        .catch(function(){ clearTimeout(to); if(i+1<eps.length) tryEp(i+1); else fail('Gagal memuat. Cek koneksi internet, lalu coba lagi.'); });
+      if(i>=eps.length){ fail('Semua server OSM sedang sibuk. Tunggu ±1 menit lalu coba lagi.'); return; }
+      var ctl=new AbortController(), to=setTimeout(function(){ ctl.abort(); },33000);
+      fetch(eps[i],{method:'POST',body:q,signal:ctl.signal})           // body mentah (tanpa data=)
+        .then(function(r){ clearTimeout(to); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+        .then(function(d){ done(d.elements||[], c, fromGPS, d.remark); })
+        .catch(function(){ clearTimeout(to);
+          if(i+1<eps.length){ setOsmStatus('<i class="fas fa-spinner fa-spin"></i> Server '+(i+1)+' sibuk, mencoba server '+(i+2)+'…'); tryEp(i+1); }
+          else fail('Gagal memuat. Pastikan ada internet dan aplikasi dibuka lewat https:// (bukan file lokal), lalu coba lagi.'); });
     })(0);
 
     function fail(msg){ $('btnOsm').disabled=false;
       setOsmStatus('<span style="color:var(--red)"><i class="fas fa-triangle-exclamation"></i> '+msg+'</span>'); }
 
-    function done(els,center){
+    function done(els,center,gps,remark){
       $('btnOsm').disabled=false;
       var existing=allMasjid(), added=0;
       els.forEach(function(el){
@@ -756,7 +775,7 @@
         if(existing.some(function(x){ return dist({lat:lat,lng:lng},x)<0.03; })) return; // ~30 m dgn titik lain
         var t=el.tags||{};
         var nm=t.name||t['name:id']||t['official_name']||'Masjid (tanpa nama)';
-        var musala=/mushol|musala|langgar|surau/i.test(nm);
+        var musala=/mushol|musala|langgar|surau/i.test(nm)||t['building']==='musalla';
         var fas=[]; if(t.toilets==='yes'||t.toilet==='yes') fas.push('wudu');
         if(t.air_conditioning==='yes') fas.push('ac'); if(t.parking) fas.push('parkir');
         var alamat=[t['addr:street'],t['addr:village'],t['addr:subdistrict'],t['addr:city']].filter(Boolean).join(', ')||'Dari OpenStreetMap';
@@ -764,12 +783,14 @@
           lat:+(+lat).toFixed(6),lng:+(+lng).toFixed(6),jumat:0,fasil:fas,perkiraan:false,source:'osm'});
         added++;
       });
-      if(state.osm.length>200){ state.osm.sort(function(a,b){ return dist(center,a)-dist(center,b); }); state.osm=state.osm.slice(0,200); }
+      if(state.osm.length>250){ state.osm.sort(function(a,b){ return dist(center,a)-dist(center,b); }); state.osm=state.osm.slice(0,250); }
       save(state); renderAll();
       $('osmClearRow').style.display=state.osm.length?'flex':'none';
-      if(added>0) setOsmStatus('<span style="color:var(--green)"><i class="fas fa-check"></i> '+added+' titik baru ditambahkan. Total dari OSM: '+state.osm.length+'.</span>');
+      var w=gps?'lokasimu':'Alun-alun Wonosari';
+      if(added>0) setOsmStatus('<span style="color:var(--green)"><i class="fas fa-check"></i> '+added+' titik baru dari OSM (sekitar '+w+'). Total OSM: '+state.osm.length+'.</span>');
+      else if(remark) fail('Server OSM sibuk (timeout). Coba lagi sebentar lagi.');
       else if(els.length) setOsmStatus('Semua titik di radius ini sudah ada di daftar.');
-      else setOsmStatus('OSM belum mendata masjid di radius ini. Coba perbesar radius, atau tandai manual.');
+      else setOsmStatus('Belum ada masjid terdata OSM dalam '+(rad/1000)+' km dari '+w+'. Coba perbesar radius, tekan Lokasi, atau tandai manual.');
     }
   }
 
